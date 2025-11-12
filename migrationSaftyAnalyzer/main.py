@@ -1,107 +1,300 @@
-import sqlparse
 import re
-from typing import Dict, List, Any
+from dataclasses import dataclass, field
+from typing import Dict, List, Any, Optional
+
+# ------------- AST definitions -------------
+
+class DDLNode:
+    raw_sql: str
+
+@dataclass
+class ColumnDef:
+    name: str
+    col_type: str
+    nullable: bool = True
+    default: Optional[str] = None
+    is_primary_key: bool = False
+
+@dataclass
+class CreateTable(DDLNode):
+    table_name: str
+    columns: List[ColumnDef]
+    table_primary_key: List[str]
+    raw_sql: str = ""
+
+@dataclass
+class AlterAction:
+    pass
+
+@dataclass
+class DropColumn(AlterAction):
+    column_name: str
+
+@dataclass
+class AddColumn(AlterAction):
+    column: ColumnDef
+
+@dataclass
+class SetNotNull(AlterAction):
+    column_name: str
+
+@dataclass
+class AlterTable(DDLNode):
+    table_name: str
+    actions: List[AlterAction]
+    raw_sql: str = ""
+
+@dataclass
+class DropTable(DDLNode):
+    table_name: str
+    raw_sql: str = ""
+
+
+# ------------- Analyzer using AST -------------
 
 class DDLAnalyzer:
     def __init__(self):
-        self.tables = {}
-        self.issues = []
+        self.tables: Dict[str, Any] = {}
+        self.issues: List[str] = []
+        self.ast: List[DDLNode] = []
 
-    def parse_ddl(self, ddl_script: str) -> Dict[str, Any]:  # Fixed: parse_ddl NOT parse_dd1
-        """Parse DDL script and return schema information"""
+    # ---------- Public API ----------
+
+    def parse_ddl(self, ddl_script: str) -> Dict[str, Any]:
+        print("\n[DEBUG] Starting DDL analysis...\n")
         statements = self._split_statements(ddl_script)
 
         for statement in statements:
-            self._analyze_statement(statement)
+            print(f"[DEBUG] Parsing statement:\n  {statement}\n")
+            node = self._build_ast(statement)
+            print(f"[DEBUG] → Built AST node: {type(node).__name__ if node else 'None'}\n")
+
+            if not node:
+                continue
+
+            self.ast.append(node)
+            self._analyze_node(node)
 
         return {
-            'tables': self.tables,
-            'issues': self.issues,
-            'summary': self._generate_summary()
+            "tables": self.tables,
+            "issues": self.issues,
+            "summary": self._generate_summary(),
+            "ast": self.ast,
         }
+
+    # ---------- Splitting & routing ----------
 
     def _split_statements(self, ddl: str) -> List[str]:
-        """Split DDL into individual statements"""
-        ddl_clean = re.sub(r'--.*$', '', ddl, flags=re.MULTILINE)
-        ddl_clean = re.sub(r'/\*.*?\*/', '', ddl_clean, flags=re.DOTALL)
-        return [stmt.strip() for stmt in ddl_clean.split(';') if stmt.strip()]
+        ddl_clean = re.sub(r"--.*$", "", ddl, flags=re.MULTILINE)
+        ddl_clean = re.sub(r"/\*.*?\*/", "", ddl_clean, flags=re.DOTALL)
+        statements = [stmt.strip() for stmt in ddl_clean.split(";") if stmt.strip()]
+        print(f"[DEBUG] Split into {len(statements)} statements\n")
+        return statements
 
-    def _analyze_statement(self, statement: str):
-        """Analyze individual DDL statement"""
-        statement_upper = statement.upper()
+    def _build_ast(self, statement: str) -> Optional[DDLNode]:
+        upper = statement.upper()
 
-        if 'CREATE TABLE' in statement_upper:
-            self._analyze_create_table(statement)
-        elif 'ALTER TABLE' in statement_upper:
-            self._analyze_alter_table(statement)
-        elif 'DROP TABLE' in statement_upper:
-            self._analyze_drop_table(statement)
+        if upper.startswith("CREATE TABLE"):
+            return self._build_create_table_ast(statement)
+        elif upper.startswith("ALTER TABLE"):
+            return self._build_alter_table_ast(statement)
+        elif upper.startswith("DROP TABLE"):
+            return self._build_drop_table_ast(statement)
+        else:
+            print("[DEBUG] Unsupported statement type\n")
+            return None
 
-    def _analyze_create_table(self, statement: str):
-        """Analyze CREATE TABLE for potential issues"""
-        # Extract table name
-        table_match = re.search(r'CREATE TABLE\s+(\w+)', statement, re.IGNORECASE)
-        if table_match:
-            table_name = table_match.group(1)
-            self.tables[table_name] = {'columns': [], 'issues': []}
+    # ---------- AST builders ----------
 
-            # Check for missing primary key
-            if 'PRIMARY KEY' not in statement.upper():
-                self.issues.append(f"Table '{table_name}' missing PRIMARY KEY")
+    def _build_create_table_ast(self, statement: str) -> Optional[CreateTable]:
+        table_match = re.search(r"CREATE\s+TABLE\s+(\w+)", statement, re.IGNORECASE)
+        if not table_match:
+            return None
 
-    def _analyze_alter_table(self, statement: str):
-        """Analyze ALTER TABLE statements"""
-        statement_upper = statement.upper()  # Added missing variable
-        if 'DROP COLUMN' in statement_upper:
-            self.issues.append("Potential data loss: DROP COLUMN operation detected")
+        table_name = table_match.group(1)
+        print(f"[DEBUG]   CREATE TABLE detected for '{table_name}'")
 
-    def _analyze_drop_table(self, statement: str):
-        """Analyze DROP TABLE statements"""
-        self.issues.append("CRITICAL: DROP TABLE operation detected")
+        m_body = re.search(r"\((.*)\)", statement, re.DOTALL)
+        parts = [p.strip() for p in m_body.group(1).split(",")] if m_body else []
+
+        columns = []
+        table_pk = []
+
+        for part in parts:
+            upper = part.upper()
+
+            if upper.startswith("PRIMARY KEY"):
+                pk_cols = re.findall(r"\(([^)]+)\)", part)
+                if pk_cols:
+                    table_pk.extend([c.strip() for c in pk_cols[0].split(",")])
+                continue
+
+            tokens = part.split()
+            if len(tokens) < 2:
+                continue
+
+            col_name = tokens[0]
+            col_type = tokens[1]
+
+            nullable = "NOT NULL" not in upper
+            default = None
+            is_pk = "PRIMARY KEY" in upper
+
+            columns.append(
+                ColumnDef(
+                    name=col_name,
+                    col_type=col_type,
+                    nullable=nullable,
+                    default=default,
+                    is_primary_key=is_pk,
+                )
+            )
+
+        return CreateTable(
+            table_name=table_name, columns=columns, table_primary_key=table_pk, raw_sql=statement
+        )
+
+    def _build_alter_table_ast(self, statement: str) -> Optional[AlterTable]:
+        m_table = re.search(r"ALTER\s+TABLE\s+(\w+)", statement, re.IGNORECASE)
+        if not m_table:
+            return None
+
+        table_name = m_table.group(1)
+        print(f"[DEBUG]   ALTER TABLE detected for '{table_name}'")
+
+        rest = statement[m_table.end():].strip()
+        action_parts = [a.strip() for a in rest.split(",")]
+
+        actions = []
+
+        for act in action_parts:
+            upper = act.upper()
+
+            if "DROP COLUMN" in upper:
+                col = re.search(r"DROP\s+COLUMN\s+(\w+)", act, re.IGNORECASE).group(1)
+                actions.append(DropColumn(column_name=col))
+
+            elif upper.startswith("ADD COLUMN"):
+                col_def = act.split(None, 2)[2]
+                tokens = col_def.split()
+                col_name = tokens[0]
+                col_type = tokens[1]
+                nullable = "NOT NULL" not in upper
+                actions.append(AddColumn(ColumnDef(col_name, col_type, nullable)))
+
+            elif "SET NOT NULL" in upper:
+                col = re.search(r"ALTER\s+COLUMN\s+(\w+)", act, re.IGNORECASE).group(1)
+                actions.append(SetNotNull(column_name=col))
+
+        return AlterTable(table_name=table_name, actions=actions, raw_sql=statement)
+
+    def _build_drop_table_ast(self, statement: str) -> Optional[DropTable]:
+        table_name = re.search(r"DROP\s+TABLE\s+(\w+)", statement, re.IGNORECASE).group(1)
+        print(f"[DEBUG]   DROP TABLE detected for '{table_name}'")
+        return DropTable(table_name=table_name, raw_sql=statement)
+
+    # ---------- AST-based analysis ----------
+
+    def _analyze_node(self, node: DDLNode):
+        print(f"[DEBUG] Analyzing AST node: {type(node).__name__}")
+
+        if isinstance(node, CreateTable):
+            self._analyze_create(node)
+        elif isinstance(node, AlterTable):
+            self._analyze_alter(node)
+        elif isinstance(node, DropTable):
+            self._analyze_drop(node)
+
+        print("[DEBUG] Current schema state:", self.tables, "\n")
+
+    def _analyze_create(self, node: CreateTable):
+        table = node.table_name
+        print(f"[DEBUG]   Handling CREATE TABLE for '{table}'")
+
+        self.tables[table] = {"columns": {}, "primary_key": []}
+
+        for col in node.columns:
+            self.tables[table]["columns"][col.name] = {
+                "type": col.col_type,
+                "nullable": col.nullable,
+            }
+
+        # Primary key rule
+        pk = node.table_primary_key + [c.name for c in node.columns if c.is_primary_key]
+        self.tables[table]["primary_key"] = pk
+
+        if not pk:
+            issue = f"Table '{table}' missing PRIMARY KEY"
+            print("[DEBUG]   ISSUE:", issue)
+            self.issues.append(issue)
+
+    def _analyze_alter(self, node: AlterTable):
+        table = node.table_name
+        print(f"[DEBUG]   Handling ALTER TABLE for '{table}'")
+
+        for act in node.actions:
+            if isinstance(act, DropColumn):
+                issue = f"Potential data loss: DROP COLUMN '{act.column_name}' on '{table}'"
+                print("[DEBUG]   ISSUE:", issue)
+                self.issues.append(issue)
+
+                self.tables[table]["columns"].pop(act.column_name, None)
+
+            elif isinstance(act, AddColumn):
+                col = act.column
+                self.tables[table]["columns"][col.name] = {
+                    "type": col.col_type,
+                    "nullable": col.nullable,
+                }
+
+                if not col.nullable:
+                    issue = f"Adding NOT NULL column '{col.name}' without default on '{table}'"
+                    print("[DEBUG]   ISSUE:", issue)
+                    self.issues.append(issue)
+
+            elif isinstance(act, SetNotNull):
+                issue = f"Risky: SET NOT NULL on '{table}.{act.column_name}'"
+                print("[DEBUG]   ISSUE:", issue)
+                self.issues.append(issue)
+
+    def _analyze_drop(self, node: DropTable):
+        table = node.table_name
+        issue = f"CRITICAL: DROP TABLE '{table}'"
+        print("[DEBUG]   ISSUE:", issue)
+        self.issues.append(issue)
+        self.tables.pop(table, None)
+
+    # ---------- Summary ----------
 
     def _generate_summary(self) -> Dict[str, Any]:
-        """Generate analysis summary"""
         return {
-            'total_tables': len(self.tables),
-            'total_issues': len(self.issues),
-            'critical_issues': len([i for i in self.issues if 'CRITICAL' in i]),
-            'warning_issues': len([i for i in self.issues if 'CRITICAL' not in i])
+            "total_tables": len(self.tables),
+            "total_issues": len(self.issues),
+            "critical_issues": sum(1 for i in self.issues if "CRITICAL" in i),
         }
 
-def main():
-    """Main function for migration safety analyzer"""
-    print("Migration Safety Analyzer")
-    print("=" * 30)
 
-    # Example DDL for testing - Fixed: sample_ddl NOT sample_dd1
+# ------------- Example usage -------------
+
+def main():
     sample_ddl = """
     CREATE TABLE users (
         id INT PRIMARY KEY,
         name VARCHAR(100),
         email VARCHAR(255)
     );
-    
-    CREATE TABLE orders (
-        order_id INT,
-        user_id INT,
-        amount DECIMAL(10,2)
-    );
-    
+
     ALTER TABLE users DROP COLUMN email;
-    DROP TABLE temporary_data;
+    ALTER TABLE users ADD COLUMN created_at TIMESTAMP NOT NULL;
+    DROP TABLE temp_data;
     """
 
     analyzer = DDLAnalyzer()
-    results = analyzer.parse_ddl(sample_ddl)  # Fixed: parse_ddl NOT parse_dd1
+    result = analyzer.parse_ddl(sample_ddl)
 
-    # Print results
-    print(f"Tables analyzed: {results['summary']['total_tables']}")
-    print(f"Issues found: {results['summary']['total_issues']}")
-    print(f"Critical issues: {results['summary']['critical_issues']}")
+    print("\n=== FINAL OUTPUT ===")
+    print(result)
 
-    print("\nDetailed Issues:")
-    for issue in results['issues']:
-        print(f"  - {issue}")
 
 if __name__ == "__main__":
     main()
