@@ -1,6 +1,20 @@
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
+
+# ------------- Read sql files -------------
+SQL_FOLDER = "../migrations/"   # <-- CHANGE THIS TO YOUR FOLDER
+
+def read_sql_files(folder: str):
+    """Return a list of (filename, contents) for all .sql files in a folder."""
+    files = []
+    for name in sorted(os.listdir(folder)):
+        if name.lower().endswith(".sql"):
+            full = os.path.join(folder, name)
+            with open(full, "r", encoding="utf-8") as f:
+                files.append((name, f.read()))
+    return files
 
 # ------------- AST definitions -------------
 
@@ -277,24 +291,32 @@ class DDLAnalyzer:
 # ------------- Example usage -------------
 
 def main():
-    sample_ddl = """
-    CREATE TABLE users (
-        id INT PRIMARY KEY,
-        name VARCHAR(100),
-        email VARCHAR(255)
-    );
+    analyzer = DDLAnalyzer()   # reuse one analyzer for whole schema
 
-    ALTER TABLE users DROP COLUMN email;
-    ALTER TABLE users ADD COLUMN created_at TIMESTAMP NOT NULL;
-    DROP TABLE temp_data;
-    """
+    print("\n=== Scanning SQL folder:", SQL_FOLDER, "===\n")
 
-    analyzer = DDLAnalyzer()
-    result = analyzer.parse_ddl(sample_ddl)
+    sql_files = read_sql_files(SQL_FOLDER)
 
-    print("\n=== FINAL OUTPUT ===")
-    print(result)
+    if not sql_files:
+        print("No .sql files found in folder:", SQL_FOLDER)
+        return
 
+    for filename, content in sql_files:
+        print("\n" + "=" * 80)
+        print(f"Analyzing file: {filename}")
+        print("=" * 80)
+
+        result = analyzer.parse_ddl(content)
+
+        print("\n[SUMMARY AFTER THIS FILE]")
+        print("  Tables:", result["summary"]["total_tables"])
+        print("  Issues:", result["summary"]["total_issues"])
+        print("  Critical:", result["summary"]["critical_issues"])
+        print()
+
+    print("\n===== FINAL OVERALL ISSUES =====")
+    for issue in analyzer.issues:
+        print("  -", issue)
 
 if __name__ == "__main__":
     main()
